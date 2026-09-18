@@ -1,0 +1,32 @@
+name: Windows build and tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test API and CLI
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Test service lifecycle
+        shell: pwsh
+        run: ./tests/service.ps1 -Executable ./build/Release/wsvc-example.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsvc-windows-x64
+          path: |
+            build/Release/wsvc-example.exe
+            build/Release/wsvc.lib
+            include/wsvc.h
+            include/wautorun.h
+  mingw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: make

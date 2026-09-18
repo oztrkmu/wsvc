@@ -1,478 +1,303 @@
-/*
- * wsvc - minimal windows service helper
- * author: Murat / oztrkmu
- */
-
+/* wsvc — Windows service helpers by Murat / oztrkmu. */
 #include "wsvc.h"
-
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 
-static SERVICE_STATUS_HANDLE svcHandle;
-static SERVICE_STATUS svcState;
-
+static SERVICE_STATUS_HANDLE serviceHandle;
+static SERVICE_STATUS serviceState;
+static SRWLOCK stateLock = SRWLOCK_INIT;
 static HANDLE stopEvent;
-static wsvcCfg svcCfg;
+static wsvcCfg serviceConfig;
 
-static void err(const wchar_t *msg)
+static int fail(DWORD code)
 {
-    fwprintf(stderr, L"wsvc: %ls: %lu\n", msg, GetLastError());
+    SetLastError(code);
+    return -1;
 }
 
-static void state(DWORD value, DWORD code, DWORD wait)
+static int valid(const wsvcCfg *cfg)
 {
-    svcState.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    svcState.dwCurrentState = value;
-    svcState.dwWin32ExitCode = code;
-    svcState.dwWaitHint = wait;
-
-    svcState.dwControlsAccepted =
-        value == SERVICE_RUNNING
-        ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
-        : 0;
-
-    SetServiceStatus(svcHandle, &svcState);
+    if (!cfg || !cfg->name || !*cfg->name || wcslen(cfg->name) > 256 ||
+        wcspbrk(cfg->name, L"/\\"))
+        return fail(ERROR_INVALID_PARAMETER);
+    return 0;
 }
 
-static DWORD WINAPI control(
-    DWORD code,
-    DWORD type,
-    LPVOID data,
-    LPVOID ctx)
+/* Caller holds stateLock. */
+static void report(DWORD value, DWORD code, DWORD hint)
 {
-    (void)type;
-    (void)data;
-    (void)ctx;
+    serviceState.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    serviceState.dwCurrentState = value;
+    serviceState.dwWin32ExitCode = code;
+    serviceState.dwWaitHint = hint;
+    serviceState.dwControlsAccepted = value == SERVICE_RUNNING
+        ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0;
+    serviceState.dwCheckPoint = (value == SERVICE_START_PENDING ||
+        value == SERVICE_STOP_PENDING) ? serviceState.dwCheckPoint + 1 : 0;
+    SetServiceStatus(serviceHandle, &serviceState);
+}
 
+static DWORD WINAPI control(DWORD code, DWORD type, LPVOID data, LPVOID ctx)
+{
+    DWORD result = NO_ERROR;
+    (void)type; (void)data; (void)ctx;
+    AcquireSRWLockExclusive(&stateLock);
     switch (code) {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
-
-        if (svcState.dwCurrentState != SERVICE_RUNNING)
-            return NO_ERROR;
-
-        state(SERVICE_STOP_PENDING, 0, 3000);
-
-        if (stopEvent)
+        if (serviceState.dwCurrentState == SERVICE_RUNNING) {
+            report(SERVICE_STOP_PENDING, NO_ERROR, 30000);
             SetEvent(stopEvent);
-
+        }
         break;
+    case SERVICE_CONTROL_INTERROGATE:
+        SetServiceStatus(serviceHandle, &serviceState);
+        break;
+    default:
+        result = ERROR_CALL_NOT_IMPLEMENTED;
     }
-
-    return NO_ERROR;
+    ReleaseSRWLockExclusive(&stateLock);
+    return result;
 }
 
 static void WINAPI serviceMain(DWORD argc, LPWSTR *argv)
 {
-    DWORD rc;
-
-    (void)argc;
-    (void)argv;
-
-    svcHandle = RegisterServiceCtrlHandlerExW(
-        svcCfg.name,
-        control,
-        NULL
-    );
-
-    if (!svcHandle)
+    DWORD code;
+    (void)argc; (void)argv;
+    serviceHandle = RegisterServiceCtrlHandlerExW(serviceConfig.name, control, NULL);
+    if (!serviceHandle)
         return;
-
-    ZeroMemory(&svcState, sizeof(svcState));
-
-    state(SERVICE_START_PENDING, 0, 3000);
-
-    stopEvent = CreateEventW(
-        NULL,
-        TRUE,
-        FALSE,
-        NULL
-    );
-
+    AcquireSRWLockExclusive(&stateLock);
+    ZeroMemory(&serviceState, sizeof(serviceState));
+    report(SERVICE_START_PENDING, NO_ERROR, 3000);
+    stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!stopEvent) {
-        rc = GetLastError();
-        state(SERVICE_STOPPED, rc, 0);
+        report(SERVICE_STOPPED, GetLastError(), 0);
+        ReleaseSRWLockExclusive(&stateLock);
         return;
     }
-
-    state(SERVICE_RUNNING, 0, 0);
-
-    rc = svcCfg.run(stopEvent);
-
+    report(SERVICE_RUNNING, NO_ERROR, 0);
+    ReleaseSRWLockExclusive(&stateLock);
+    code = serviceConfig.run(stopEvent);
+    AcquireSRWLockExclusive(&stateLock);
+    report(SERVICE_STOPPED, code, 0);
     CloseHandle(stopEvent);
     stopEvent = NULL;
-
-    state(SERVICE_STOPPED, rc, 0);
+    ReleaseSRWLockExclusive(&stateLock);
 }
 
 int wsvcRun(const wsvcCfg *cfg)
 {
-    SERVICE_TABLE_ENTRYW table[2];
-
-    if (!cfg || !cfg->name || !cfg->run)
+    SERVICE_TABLE_ENTRYW table[2] = {{0}};
+    if (valid(cfg) != 0)
         return -1;
-
-    svcCfg = *cfg;
-
+    if (!cfg->run)
+        return fail(ERROR_INVALID_PARAMETER);
+    serviceConfig = *cfg;
     table[0].lpServiceName = (LPWSTR)cfg->name;
     table[0].lpServiceProc = serviceMain;
+    return StartServiceCtrlDispatcherW(table) ? 0 : -1;
+}
 
-    table[1].lpServiceName = NULL;
-    table[1].lpServiceProc = NULL;
+static SC_HANDLE openService(const wsvcCfg *cfg, DWORD access)
+{
+    SC_HANDLE manager, service;
+    DWORD code;
+    if (valid(cfg) != 0)
+        return NULL;
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!manager)
+        return NULL;
+    service = OpenServiceW(manager, cfg->name, access);
+    code = service ? NO_ERROR : GetLastError();
+    CloseServiceHandle(manager);
+    SetLastError(code);
+    return service;
+}
 
-    if (!StartServiceCtrlDispatcherW(table)) {
-        err(L"dispatcher");
-        return -1;
-    }
-
-    return 0;
+static int finish(SC_HANDLE service, DWORD code)
+{
+    CloseServiceHandle(service);
+    return code == NO_ERROR ? 0 : fail(code);
 }
 
 int wsvcInstall(const wsvcCfg *cfg)
 {
-    WCHAR exe[MAX_PATH];
-    WCHAR cmd[MAX_PATH + 32];
-
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-
-    SERVICE_DESCRIPTIONW desc;
-    SERVICE_DELAYED_AUTO_START_INFO delay;
-
-    SC_ACTION action[3];
-    SERVICE_FAILURE_ACTIONS failure;
-
-    DWORD n;
-
-    if (!cfg || !cfg->name)
+    const DWORD capacity = 32768;
+    wchar_t *path, *command;
+    DWORD length, code = NO_ERROR;
+    SC_HANDLE manager, service;
+    SERVICE_DESCRIPTIONW description;
+    SERVICE_DELAYED_AUTO_START_INFO delayed;
+    SERVICE_FAILURE_ACTIONSW recovery = {0};
+    SC_ACTION actions[] = {{SC_ACTION_RESTART, 5000},
+                           {SC_ACTION_RESTART, 15000}, {SC_ACTION_NONE, 0}};
+    if (valid(cfg) != 0)
         return -1;
-
-    n = GetModuleFileNameW(NULL, exe, MAX_PATH);
-
-    if (!n || n >= MAX_PATH) {
-        err(L"path");
-        return -1;
+    if (cfg->startup < WSVC_START_DELAYED || cfg->startup > WSVC_START_MANUAL)
+        return fail(ERROR_INVALID_PARAMETER);
+    path = calloc(capacity, sizeof(*path));
+    command = calloc(capacity + 16, sizeof(*command));
+    if (!path || !command) {
+        free(path); free(command);
+        return fail(ERROR_NOT_ENOUGH_MEMORY);
     }
-
-    if (swprintf(
-            cmd,
-            MAX_PATH + 32,
-            L"\"%ls\" --service",
-            exe) < 0)
-        return -1;
-
-    scm = OpenSCManagerW(
-        NULL,
-        NULL,
-        SC_MANAGER_CREATE_SERVICE
-    );
-
-    if (!scm) {
-        err(L"scm");
-        return -1;
+    length = GetModuleFileNameW(NULL, path, capacity);
+    if (!length || length >= capacity) {
+        code = length ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+        free(path); free(command);
+        return fail(code);
     }
-
-    svc = CreateServiceW(
-        scm,
-        cfg->name,
+    if (swprintf(command, capacity + 16, L"\"%ls\" --service", path) < 0) {
+        free(path); free(command);
+        return fail(ERROR_INSUFFICIENT_BUFFER);
+    }
+    free(path);
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!manager) {
+        code = GetLastError(); free(command);
+        return fail(code);
+    }
+    service = CreateServiceW(manager, cfg->name,
         cfg->display ? cfg->display : cfg->name,
-
-        SERVICE_CHANGE_CONFIG |
-        SERVICE_QUERY_STATUS |
-        SERVICE_START |
-        SERVICE_STOP |
-        DELETE,
-
+        SERVICE_CHANGE_CONFIG | SERVICE_START | DELETE,
         SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START,
-        SERVICE_ERROR_NORMAL,
-
-        cmd,
-
-        NULL,
-        NULL,
-        NULL,
-
-        L"NT AUTHORITY\\LocalService",
-        NULL
-    );
-
-    if (!svc) {
-        err(L"create");
-        CloseServiceHandle(scm);
-        return -1;
+        cfg->startup == WSVC_START_MANUAL ? SERVICE_DEMAND_START : SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL, command, NULL, NULL, NULL,
+        L"NT AUTHORITY\\LocalService", NULL);
+    code = service ? NO_ERROR : GetLastError();
+    free(command);
+    CloseServiceHandle(manager);
+    if (!service)
+        return fail(code);
+    description.lpDescription = (LPWSTR)cfg->desc;
+    delayed.fDelayedAutostart = cfg->startup == WSVC_START_DELAYED;
+    recovery.dwResetPeriod = 86400;
+    recovery.cActions = sizeof(actions) / sizeof(actions[0]);
+    recovery.lpsaActions = actions;
+    if (cfg->desc && !ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description))
+        code = GetLastError();
+    if (!code && cfg->startup != WSVC_START_MANUAL &&
+        !ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed))
+        code = GetLastError();
+    if (!code && !ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &recovery))
+        code = GetLastError();
+    if (code) {
+        /* Roll back a newly created service; never alter an existing service. */
+        if (!DeleteService(service))
+            fwprintf(stderr, L"wsvc: install rollback failed: %lu\n", GetLastError());
     }
+    return finish(service, code);
+}
 
-    if (cfg->desc) {
-        desc.lpDescription = (LPWSTR)cfg->desc;
+static DWORD query(SC_HANDLE service, SERVICE_STATUS_PROCESS *status)
+{
+    DWORD needed;
+    return QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)status, sizeof(*status), &needed) ? NO_ERROR : GetLastError();
+}
 
-        if (!ChangeServiceConfig2W(
-                svc,
-                SERVICE_CONFIG_DESCRIPTION,
-                &desc))
-            err(L"desc");
+static DWORD waitFor(SC_HANDLE service, DWORD desired)
+{
+    ULONGLONG started = GetTickCount64();
+    SERVICE_STATUS_PROCESS status;
+    for (;;) {
+        DWORD code = query(service, &status);
+        if (code)
+            return code;
+        if (status.dwCurrentState == desired)
+            return NO_ERROR;
+        if (desired == SERVICE_RUNNING && status.dwCurrentState == SERVICE_STOPPED)
+            return status.dwWin32ExitCode ? status.dwWin32ExitCode : ERROR_SERVICE_NOT_ACTIVE;
+        if (GetTickCount64() - started >= 30000)
+            return ERROR_TIMEOUT;
+        Sleep(100);
     }
-
-    delay.fDelayedAutostart = TRUE;
-
-    if (!ChangeServiceConfig2W(
-            svc,
-            SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
-            &delay))
-        err(L"delay");
-
-    action[0].Type = SC_ACTION_RESTART;
-    action[0].Delay = 5000;
-
-    action[1].Type = SC_ACTION_RESTART;
-    action[1].Delay = 15000;
-
-    action[2].Type = SC_ACTION_RESTART;
-    action[2].Delay = 60000;
-
-    ZeroMemory(&failure, sizeof(failure));
-
-    failure.dwResetPeriod = 86400;
-    failure.cActions = 3;
-    failure.lpsaActions = action;
-
-    if (!ChangeServiceConfig2W(
-            svc,
-            SERVICE_CONFIG_FAILURE_ACTIONS,
-            &failure))
-        err(L"recovery");
-
-    wprintf(L"wsvc: installed\n");
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    return 0;
 }
 
 int wsvcStart(const wsvcCfg *cfg)
 {
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-
-    scm = OpenSCManagerW(
-        NULL,
-        NULL,
-        SC_MANAGER_CONNECT
-    );
-
-    if (!scm) {
-        err(L"scm");
+    SC_HANDLE service = openService(cfg, SERVICE_START | SERVICE_QUERY_STATUS);
+    DWORD code = NO_ERROR;
+    if (!service)
         return -1;
+    if (!StartServiceW(service, 0, NULL)) {
+        code = GetLastError();
+        if (code == ERROR_SERVICE_ALREADY_RUNNING)
+            code = NO_ERROR;
     }
-
-    svc = OpenServiceW(
-        scm,
-        cfg->name,
-        SERVICE_START
-    );
-
-    if (!svc) {
-        err(L"open");
-        CloseServiceHandle(scm);
-        return -1;
-    }
-
-    if (!StartServiceW(svc, 0, NULL)) {
-        DWORD e = GetLastError();
-
-        if (e != ERROR_SERVICE_ALREADY_RUNNING) {
-            SetLastError(e);
-            err(L"start");
-
-            CloseServiceHandle(svc);
-            CloseServiceHandle(scm);
-
-            return -1;
-        }
-    }
-
-    wprintf(L"wsvc: started\n");
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    return 0;
+    if (!code)
+        code = waitFor(service, SERVICE_RUNNING);
+    return finish(service, code);
 }
 
 int wsvcStop(const wsvcCfg *cfg)
 {
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-
-    SERVICE_STATUS state;
-
-    scm = OpenSCManagerW(
-        NULL,
-        NULL,
-        SC_MANAGER_CONNECT
-    );
-
-    if (!scm) {
-        err(L"scm");
+    SC_HANDLE service = openService(cfg, SERVICE_STOP | SERVICE_QUERY_STATUS);
+    SERVICE_STATUS_PROCESS status;
+    SERVICE_STATUS response;
+    DWORD code;
+    if (!service)
         return -1;
+    code = query(service, &status);
+    if (!code && status.dwCurrentState != SERVICE_STOPPED &&
+        status.dwCurrentState != SERVICE_STOP_PENDING &&
+        !ControlService(service, SERVICE_CONTROL_STOP, &response)) {
+        code = GetLastError();
+        if (code == ERROR_SERVICE_NOT_ACTIVE)
+            code = NO_ERROR;
     }
-
-    svc = OpenServiceW(
-        scm,
-        cfg->name,
-        SERVICE_STOP
-    );
-
-    if (!svc) {
-        err(L"open");
-        CloseServiceHandle(scm);
-        return -1;
-    }
-
-    if (!ControlService(
-            svc,
-            SERVICE_CONTROL_STOP,
-            &state)) {
-
-        DWORD e = GetLastError();
-
-        if (e != ERROR_SERVICE_NOT_ACTIVE) {
-            SetLastError(e);
-            err(L"stop");
-
-            CloseServiceHandle(svc);
-            CloseServiceHandle(scm);
-
-            return -1;
-        }
-    }
-
-    wprintf(L"wsvc: stopped\n");
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    return 0;
+    if (!code)
+        code = waitFor(service, SERVICE_STOPPED);
+    return finish(service, code);
 }
 
 int wsvcRemove(const wsvcCfg *cfg)
 {
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-
-    scm = OpenSCManagerW(
-        NULL,
-        NULL,
-        SC_MANAGER_CONNECT
-    );
-
-    if (!scm) {
-        err(L"scm");
+    SC_HANDLE service = openService(cfg, DELETE | SERVICE_QUERY_STATUS);
+    SERVICE_STATUS_PROCESS status;
+    DWORD code;
+    if (!service)
         return -1;
-    }
+    code = query(service, &status);
+    if (!code && status.dwCurrentState != SERVICE_STOPPED)
+        code = ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
+    if (!code && !DeleteService(service))
+        code = GetLastError();
+    return finish(service, code);
+}
 
-    svc = OpenServiceW(
-        scm,
-        cfg->name,
-        DELETE
-    );
-
-    if (!svc) {
-        err(L"open");
-        CloseServiceHandle(scm);
+int wsvcQuery(const wsvcCfg *cfg, SERVICE_STATUS_PROCESS *status)
+{
+    SC_HANDLE service;
+    DWORD code;
+    if (!status)
+        return fail(ERROR_INVALID_PARAMETER);
+    service = openService(cfg, SERVICE_QUERY_STATUS);
+    if (!service)
         return -1;
-    }
-
-    if (!DeleteService(svc)) {
-        err(L"remove");
-
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-
-        return -1;
-    }
-
-    wprintf(L"wsvc: removed\n");
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
-    return 0;
+    code = query(service, status);
+    return finish(service, code);
 }
 
 int wsvcStatus(const wsvcCfg *cfg)
 {
-    SC_HANDLE scm;
-    SC_HANDLE svc;
-
-    SERVICE_STATUS_PROCESS st;
-    DWORD need;
-
-    scm = OpenSCManagerW(
-        NULL,
-        NULL,
-        SC_MANAGER_CONNECT
-    );
-
-    if (!scm) {
-        err(L"scm");
+    SERVICE_STATUS_PROCESS status;
+    const wchar_t *name;
+    if (wsvcQuery(cfg, &status) != 0)
         return -1;
+    switch (status.dwCurrentState) {
+    case SERVICE_STOPPED: name = L"stopped"; break;
+    case SERVICE_START_PENDING: name = L"starting"; break;
+    case SERVICE_STOP_PENDING: name = L"stopping"; break;
+    case SERVICE_RUNNING: name = L"running"; break;
+    case SERVICE_CONTINUE_PENDING: name = L"continuing"; break;
+    case SERVICE_PAUSE_PENDING: name = L"pausing"; break;
+    case SERVICE_PAUSED: name = L"paused"; break;
+    default: name = L"unknown";
     }
-
-    svc = OpenServiceW(
-        scm,
-        cfg->name,
-        SERVICE_QUERY_STATUS
-    );
-
-    if (!svc) {
-        err(L"open");
-        CloseServiceHandle(scm);
-        return -1;
-    }
-
-    if (!QueryServiceStatusEx(
-            svc,
-            SC_STATUS_PROCESS_INFO,
-            (LPBYTE)&st,
-            sizeof(st),
-            &need)) {
-
-        err(L"status");
-
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
-
-        return -1;
-    }
-
-    switch (st.dwCurrentState) {
-    case SERVICE_RUNNING:
-        wprintf(L"wsvc: running\n");
-        break;
-
-    case SERVICE_STOPPED:
-        wprintf(L"wsvc: stopped\n");
-        break;
-
-    case SERVICE_START_PENDING:
-        wprintf(L"wsvc: starting\n");
-        break;
-
-    case SERVICE_STOP_PENDING:
-        wprintf(L"wsvc: stopping\n");
-        break;
-
-    default:
-        wprintf(
-            L"wsvc: state: %lu\n",
-            st.dwCurrentState
-        );
-    }
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-
+    wprintf(L"%ls: %ls (PID %lu, exit %lu)\n", cfg->name, name,
+        status.dwProcessId, status.dwWin32ExitCode);
     return 0;
 }
